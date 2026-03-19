@@ -1,0 +1,20 @@
+{
+  "name": "x-scraper-bot",
+  "version": "1.0.0",
+  "description": "Simple X/Twitter Scraper to WhatsApp Channel",
+  "main": "bot.js",
+  "scripts": {
+    "start": "node bot.js",
+    "dev": "nodemon bot.js",
+    "test": "node test.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "better-sqlite3": "^9.4.0",
+    "dotenv": "^16.3.1",
+    "puppeteer": "^21.5.0"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.0"
+  }
+}
