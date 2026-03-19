@@ -1,0 +1,38 @@
+version: '3.8'
+
+services:
+  waha:
+    image: devlikeapro/waha-plus:latest
+    container_name: x-scraper-waha
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - WAHA_SESSION_NAME=default
+      - WAHA_ENGINE=NOWEB
+    volumes:
+      - waha_data:/app/.sessions
+
+  bot:
+    build: .
+    container_name: x-scraper-bot
+    restart: unless-stopped
+    environment:
+      - TARGET_ACCOUNTS=${TARGET_ACCOUNTS}
+      - FILTER_KEYWORDS=${FILTER_KEYWORDS:-}
+      - SKIP_REPLIES=${SKIP_REPLIES:-true}
+      - SKIP_RETWEETS=${SKIP_RETWEETS:-true}
+      - WAHA_URL=http://waha:3000
+      - WAHA_CHANNEL_ID=${WAHA_CHANNEL_ID}
+      - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-5}
+      - MESSAGE_DELAY_MS=${MESSAGE_DELAY_MS:-5000}
+      - MAX_T[EETS_PER_CHECK={MAX_TWEETS_PER_CHECK:-5}
+      - HEADLESS=true
+    volumes:
+      - ./data:/app/data
+      - ./logs:/app/logs
+    depends_on:
+      - waha
+
+volumes:
+  waha_data:
