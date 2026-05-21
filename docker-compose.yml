@@ -26,7 +26,8 @@ services:
       - WAHA_CHANNEL_ID=${WAHA_CHANNEL_ID}
       - CHECK_INTERVAL_MINUTES=${CHECK_INTERVAL_MINUTES:-5}
       - MESSAGE_DELAY_MS=${MESSAGE_DELAY_MS:-5000}
-      - MAX_T[EETS_PER_CHECK={MAX_TWEETS_PER_CHECK:-5}
+      - MAX_TWEETS_PER_CHECK=${MAX_TWEETS_PER_CHECK:-5}
+      - WAHA_SESSION=${WAHA_SESSION:-default}
       - HEADLESS=true
     volumes:
       - ./data:/app/data
