@@ -6,6 +6,10 @@
  *
  * Run as a script:   node bot.js
  * Or require:        const { CONFIG, scrapeAccount, ... } = require('./bot.js')
+ *
+ * Requiring this module has zero side effects: no fs.mkdirSync, no SQLite
+ * open, no puppeteer launch. The scheduler IIFE only runs when invoked
+ * directly via `node bot.js`.
  */
 
 require('dotenv').config();
@@ -31,27 +35,32 @@ function parseIntClamped(value, fallback, min) {
   return parsed < min ? min : parsed;
 }
 
-const CONFIG = {
-  wahaUrl: process.env.WAHA_URL || 'http://localhost:3000',
-  wahaSession: process.env.WAHA_SESSION || 'default',
-  wahaChannelId: process.env.WAHA_CHANNEL_ID || '',
-  targetAccounts: (process.env.TARGET_ACCOUNTS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .map((s) => (s.startsWith('@') ? s.slice(1) : s)),
-  filterKeywords: (process.env.FILTER_KEYWORDS || '')
-    .split(',')
-    .map((s) => s.trim().toLowerCase())
-    .filter(Boolean),
-  skipReplies: parseBool(process.env.SKIP_REPLIES, true),
-  skipRetweets: parseBool(process.env.SKIP_RETWEETS, true),
-  checkIntervalMinutes: parseIntClamped(process.env.CHECK_INTERVAL_MINUTES, 5, 1),
-  messageDelayMs: parseIntClamped(process.env.MESSAGE_DELAY_MS, 5000, 1000),
-  maxTweetsPerCheck: parseIntClamped(process.env.MAX_TWEETS_PER_CHECK, 5, 1),
-  headless: parseBool(process.env.HEADLESS, true),
-  puppeteerExecutablePath: process.env.PUPPETEER_EXECUTABLE_PATH || undefined,
-};
+function loadConfig(env) {
+  const e = env || process.env;
+  return {
+    wahaUrl: e.WAHA_URL || 'http://localhost:3000',
+    wahaSession: e.WAHA_SESSION || 'default',
+    wahaChannelId: e.WAHA_CHANNEL_ID || '',
+    targetAccounts: (e.TARGET_ACCOUNTS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean)
+      .map((s) => (s.startsWith('@') ? s.slice(1) : s)),
+    filterKeywords: (e.FILTER_KEYWORDS || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+    skipReplies: parseBool(e.SKIP_REPLIES, true),
+    skipRetweets: parseBool(e.SKIP_RETWEETS, true),
+    checkIntervalMinutes: parseIntClamped(e.CHECK_INTERVAL_MINUTES, 5, 1),
+    messageDelayMs: parseIntClamped(e.MESSAGE_DELAY_MS, 5000, 1000),
+    maxTweetsPerCheck: parseIntClamped(e.MAX_TWEETS_PER_CHECK, 5, 1),
+    headless: parseBool(e.HEADLESS, true),
+    puppeteerExecutablePath: e.PUPPETEER_EXECUTABLE_PATH || undefined,
+  };
+}
+
+const CONFIG = loadConfig();
 
 // ---------------------------------------------------------------------------
 // Logger - JSON-line records to ./logs/bot.log + human-readable console
@@ -59,41 +68,54 @@ const CONFIG = {
 
 const LOG_DIR = path.resolve('./logs');
 const LOG_FILE = path.join(LOG_DIR, 'bot.log');
-fs.mkdirSync(LOG_DIR, { recursive: true });
 
-function writeLog(level, message, extra) {
-  const record = {
-    timestamp: new Date().toISOString(),
-    level,
-    message,
-    ...(extra && typeof extra === 'object' ? extra : {}),
+function createLogger(options) {
+  const opts = options || {};
+  const logFile = opts.logFile || null;
+  const out = opts.console || console;
+
+  function writeLog(level, message, extra) {
+    const record = {
+      timestamp: new Date().toISOString(),
+      level,
+      message,
+      ...(extra && typeof extra === 'object' ? extra : {}),
+    };
+    if (logFile) {
+      try {
+        fs.appendFileSync(logFile, JSON.stringify(record) + '\n');
+      } catch (err) {
+        // If we cannot write the log file, fall through to console only.
+        // eslint-disable-next-line no-console
+        out.error('Failed to write log file:', err.message);
+      }
+    }
+    const prefix = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
+    const human = `[${record.timestamp}] ${prefix} ${level.toUpperCase()}: ${message}`;
+    if (level === 'error') {
+      out.error(human);
+    } else if (level === 'warn') {
+      out.warn(human);
+    } else {
+      out.log(human);
+    }
+  }
+
+  return {
+    info: (msg, extra) => writeLog('info', msg, extra),
+    warn: (msg, extra) => writeLog('warn', msg, extra),
+    error: (msg, extra) => writeLog('error', msg, extra),
   };
-  try {
-    fs.appendFileSync(LOG_FILE, JSON.stringify(record) + '\n');
-  } catch (err) {
-    // If we cannot write the log file, fall through to console only.
-    // eslint-disable-next-line no-console
-    console.error('Failed to write log file:', err.message);
-  }
-  const prefix = level === 'error' ? '❌' : level === 'warn' ? '⚠️' : 'ℹ️';
-  const human = `[${record.timestamp}] ${prefix} ${level.toUpperCase()}: ${message}`;
-  if (level === 'error') {
-    // eslint-disable-next-line no-console
-    console.error(human);
-  } else if (level === 'warn') {
-    // eslint-disable-next-line no-console
-    console.warn(human);
-  } else {
-    // eslint-disable-next-line no-console
-    console.log(human);
-  }
 }
 
-const log = {
-  info: (msg, extra) => writeLog('info', msg, extra),
-  warn: (msg, extra) => writeLog('warn', msg, extra),
-  error: (msg, extra) => writeLog('error', msg, extra),
-};
+let loggerSingleton = null;
+function getLogger() {
+  if (!loggerSingleton) {
+    fs.mkdirSync(LOG_DIR, { recursive: true });
+    loggerSingleton = createLogger({ logFile: LOG_FILE });
+  }
+  return loggerSingleton;
+}
 
 // ---------------------------------------------------------------------------
 // SQLite - tweet dedup store
@@ -101,31 +123,53 @@ const log = {
 
 const DATA_DIR = path.resolve('./data');
 const DB_PATH = path.join(DATA_DIR, 'bot.db');
-fs.mkdirSync(DATA_DIR, { recursive: true });
 
-const db = new Database(DB_PATH);
-db.pragma('journal_mode = WAL');
+function createDb(options) {
+  const opts = options || {};
+  const dbPath = opts.path || ':memory:';
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
 
-db.exec(`
-  CREATE TABLE IF NOT EXISTS tweets (
-    id TEXT PRIMARY KEY,
-    username TEXT NOT NULL,
-    content TEXT,
-    tweet_url TEXT,
-    posted_to_whatsapp INTEGER NOT NULL DEFAULT 0,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS tweets (
+      id TEXT PRIMARY KEY,
+      username TEXT NOT NULL,
+      content TEXT,
+      tweet_url TEXT,
+      posted_to_whatsapp INTEGER NOT NULL DEFAULT 0,
+      created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    );
+    CREATE INDEX IF NOT EXISTS idx_tweets_username_created
+      ON tweets (username, created_at);
+  `);
+
+  const stmtInsertTweet = db.prepare(
+    'INSERT OR IGNORE INTO tweets (id, username, content, tweet_url, posted_to_whatsapp) VALUES (?, ?, ?, ?, 0)'
   );
-  CREATE INDEX IF NOT EXISTS idx_tweets_username_created
-    ON tweets (username, created_at);
-`);
+  const stmtFindTweet = db.prepare(
+    'SELECT id FROM tweets WHERE id = ? AND posted_to_whatsapp = 1'
+  );
+  const stmtMarkPosted = db.prepare(
+    'UPDATE tweets SET posted_to_whatsapp = 1 WHERE id = ?'
+  );
 
-const stmtInsertTweet = db.prepare(
-  'INSERT OR IGNORE INTO tweets (id, username, content, tweet_url, posted_to_whatsapp) VALUES (?, ?, ?, ?, 0)'
-);
-const stmtFindTweet = db.prepare('SELECT id FROM tweets WHERE id = ? AND posted_to_whatsapp = 1');
-const stmtMarkPosted = db.prepare(
-  'UPDATE tweets SET posted_to_whatsapp = 1 WHERE id = ?'
-);
+  return {
+    db,
+    stmtInsertTweet,
+    stmtFindTweet,
+    stmtMarkPosted,
+    close: () => db.close(),
+  };
+}
+
+let dbHandle = null;
+function getDb() {
+  if (!dbHandle) {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    dbHandle = createDb({ path: DB_PATH });
+  }
+  return dbHandle;
+}
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -161,7 +205,11 @@ function usernameFromHref(href) {
 // Scraper
 // ---------------------------------------------------------------------------
 
-async function scrapeAccount(browser, username) {
+async function scrapeAccount(browser, username, options) {
+  const opts = options || {};
+  const config = opts.config || CONFIG;
+  const log = opts.log || getLogger();
+
   const page = await browser.newPage();
   try {
     await page.setViewport({ width: 1920, height: 1080 });
@@ -196,7 +244,7 @@ async function scrapeAccount(browser, username) {
       return [];
     }
 
-    const limit = CONFIG.maxTweetsPerCheck * 3;
+    const limit = config.maxTweetsPerCheck * 3;
     const tweets = await page.evaluate((maxItems) => {
       const out = [];
       const articles = document.querySelectorAll('article[data-testid="tweet"]');
@@ -254,19 +302,24 @@ async function scrapeAccount(browser, username) {
 // Filter
 // ---------------------------------------------------------------------------
 
-function filterTweets(tweets, username) {
+function filterTweets(tweets, username, options) {
+  const opts = options || {};
+  const config = opts.config || CONFIG;
+  const dbDeps = opts.db || getDb();
+  const stmtFindTweet = dbDeps.stmtFindTweet;
+
   const expected = String(username || '').toLowerCase();
-  const keywords = CONFIG.filterKeywords;
+  const keywords = config.filterKeywords;
 
   const kept = [];
   for (const t of tweets) {
     if (!t || !t.href || !t.text) continue;
-    if (CONFIG.skipReplies && t.isReply) continue;
-    if (CONFIG.skipRetweets && t.isRetweet) continue;
+    if (config.skipReplies && t.isReply) continue;
+    if (config.skipRetweets && t.isRetweet) continue;
 
     // Defend against pinned/quoted reposts where the path username
     // doesn't match the requested account.
-    if (CONFIG.skipRetweets) {
+    if (config.skipRetweets) {
       const pathUser = usernameFromHref(t.href);
       if (pathUser && pathUser !== expected) continue;
     }
@@ -279,7 +332,7 @@ function filterTweets(tweets, username) {
 
     const id = tweetIdFromHref(t.href);
     if (!id) continue;
-    if (stmtFindTweet.get(id)) continue; // already seen
+    if (stmtFindTweet.get(id)) continue; // already posted
 
     kept.push({
       id,
@@ -297,7 +350,7 @@ function filterTweets(tweets, username) {
     return ta - tb;
   });
 
-  return kept.slice(0, CONFIG.maxTweetsPerCheck);
+  return kept.slice(0, config.maxTweetsPerCheck);
 }
 
 // ---------------------------------------------------------------------------
@@ -308,18 +361,25 @@ function formatMessage(tweet) {
   return `🐦 @${tweet.username}\n\n${tweet.content}\n\n🔗 ${tweet.tweet_url}`;
 }
 
-async function postToWhatsApp(tweet) {
+async function postToWhatsApp(tweet, options) {
+  const opts = options || {};
+  const config = opts.config || CONFIG;
+  const dbDeps = opts.db || getDb();
+  const http = opts.http || axios;
+  const log = opts.log || getLogger();
+  const { stmtInsertTweet, stmtMarkPosted } = dbDeps;
+
   // Insert the row with posted=0 BEFORE sending so a crash mid-post
   // doesn't lose the dedup record. We flip the flag only on success.
   stmtInsertTweet.run(tweet.id, tweet.username, tweet.content, tweet.tweet_url);
 
   const text = formatMessage(tweet);
   try {
-    const response = await axios.post(
-      `${CONFIG.wahaUrl}/api/sendText`,
+    const response = await http.post(
+      `${config.wahaUrl}/api/sendText`,
       {
-        session: CONFIG.wahaSession,
-        chatId: CONFIG.wahaChannelId,
+        session: config.wahaSession,
+        chatId: config.wahaChannelId,
         text,
         linkPreview: false,
       },
@@ -354,30 +414,34 @@ async function postToWhatsApp(tweet) {
 // Cycle
 // ---------------------------------------------------------------------------
 
-async function runCycle(browser) {
-  log.info(`Starting cycle for ${CONFIG.targetAccounts.length} account(s)`);
+async function runCycle(browser, options) {
+  const opts = options || {};
+  const config = opts.config || CONFIG;
+  const log = opts.log || getLogger();
 
-  for (const username of CONFIG.targetAccounts) {
+  log.info(`Starting cycle for ${config.targetAccounts.length} account(s)`);
+
+  for (const username of config.targetAccounts) {
     let scraped = 0;
     let fresh = 0;
     let posted = 0;
     let errors = 0;
 
     try {
-      const tweets = await scrapeAccount(browser, username);
+      const tweets = await scrapeAccount(browser, username, { config, log });
       scraped = tweets.length;
 
-      const newTweets = filterTweets(tweets, username);
+      const newTweets = filterTweets(tweets, username, opts);
       fresh = newTweets.length;
 
       for (const tweet of newTweets) {
-        const ok = await postToWhatsApp(tweet);
+        const ok = await postToWhatsApp(tweet, opts);
         if (ok) {
           posted += 1;
         } else {
           errors += 1;
         }
-        await sleep(CONFIG.messageDelayMs);
+        await sleep(config.messageDelayMs);
       }
     } catch (err) {
       errors += 1;
@@ -406,6 +470,15 @@ module.exports = {
   filterTweets,
   postToWhatsApp,
   runCycle,
+  // Factories and helpers exposed for tests and the CLI:
+  loadConfig,
+  createLogger,
+  createDb,
+  parseBool,
+  parseIntClamped,
+  tweetIdFromHref,
+  usernameFromHref,
+  formatMessage,
 };
 
 // ---------------------------------------------------------------------------
@@ -426,6 +499,9 @@ if (require.main === module) {
     process.exit(1);
   }
 
+  const log = getLogger();
+  const dbDeps = getDb();
+
   let browser = null;
   let intervalHandle = null;
   let shuttingDown = false;
@@ -444,7 +520,7 @@ if (require.main === module) {
       log.error(`Error closing browser: ${err.message}`);
     }
     try {
-      db.close();
+      dbDeps.close();
     } catch (err) {
       log.error(`Error closing database: ${err.message}`);
     }
