@@ -461,6 +461,131 @@ async function runCycle(browser, options) {
 }
 
 // ---------------------------------------------------------------------------
+// Scheduler - shared body used by both `node bot.js` and `node cli.js start`
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate the env required by the scheduler. Returns an array of missing
+ * variable names (empty when all required vars are present).
+ */
+function validateSchedulerEnv(config) {
+  const c = config || CONFIG;
+  const missing = [];
+  if (!c.targetAccounts || c.targetAccounts.length === 0) missing.push('TARGET_ACCOUNTS');
+  if (!c.wahaChannelId) missing.push('WAHA_CHANNEL_ID');
+  return missing;
+}
+
+/**
+ * Launch puppeteer and run the scheduler. With `once: true` runs a single
+ * cycle then resolves; with `once: false` runs the immediate cycle, installs
+ * the setInterval, and resolves once the scheduler is wired (the process
+ * stays alive via the interval handle).
+ */
+async function startScheduler(options) {
+  const opts = options || {};
+  const once = Boolean(opts.once);
+  const config = opts.config || CONFIG;
+  const log = opts.log || getLogger();
+  const dbDeps = opts.db || getDb();
+  const launcher = opts.puppeteer || puppeteer;
+
+  let browser = null;
+  let intervalHandle = null;
+  let shuttingDown = false;
+
+  async function shutdown(signal, exitCode) {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    log.info(`Received ${signal}, shutting down...`);
+    if (intervalHandle) {
+      clearInterval(intervalHandle);
+      intervalHandle = null;
+    }
+    try {
+      if (browser) await browser.close();
+    } catch (err) {
+      log.error(`Error closing browser: ${err.message}`);
+    }
+    try {
+      dbDeps.close();
+    } catch (err) {
+      log.error(`Error closing database: ${err.message}`);
+    }
+    process.exit(exitCode != null ? exitCode : 0);
+  }
+
+  if (!once) {
+    process.on('SIGINT', () => shutdown('SIGINT'));
+    process.on('SIGTERM', () => shutdown('SIGTERM'));
+    process.on('unhandledRejection', (reason) => {
+      log.error(
+        `Unhandled rejection: ${reason && reason.message ? reason.message : reason}`,
+        { reason: reason && reason.stack ? reason.stack : String(reason) }
+      );
+    });
+  }
+
+  log.info('Starting X scraper bot', {
+    targetAccounts: config.targetAccounts,
+    checkIntervalMinutes: config.checkIntervalMinutes,
+    headless: config.headless,
+    once,
+  });
+
+  const launchOptions = {
+    headless: config.headless ? 'new' : false,
+    args: [
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
+      '--disable-dev-shm-usage',
+    ],
+  };
+  if (config.puppeteerExecutablePath) {
+    launchOptions.executablePath = config.puppeteerExecutablePath;
+  }
+
+  try {
+    browser = await launcher.launch(launchOptions);
+  } catch (err) {
+    log.error(`Failed to launch puppeteer: ${err.message}`);
+    process.exit(1);
+  }
+
+  if (once) {
+    try {
+      await runCycle(browser, { config, log, db: dbDeps });
+    } catch (err) {
+      log.error(`Cycle failed: ${err.message}`, { stack: err.stack });
+    }
+    try {
+      await browser.close();
+    } catch (err) {
+      log.error(`Error closing browser: ${err.message}`);
+    }
+    try {
+      dbDeps.close();
+    } catch (err) {
+      log.error(`Error closing database: ${err.message}`);
+    }
+    return;
+  }
+
+  // Run once immediately.
+  try {
+    await runCycle(browser, { config, log, db: dbDeps });
+  } catch (err) {
+    log.error(`Initial cycle failed: ${err.message}`, { stack: err.stack });
+  }
+
+  intervalHandle = setInterval(() => {
+    runCycle(browser, { config, log, db: dbDeps }).catch((err) =>
+      log.error(`Cycle failed: ${err.message}`, { stack: err.stack })
+    );
+  }, config.checkIntervalMinutes * 60 * 1000);
+}
+
+// ---------------------------------------------------------------------------
 // Module exports - safe to require without launching anything
 // ---------------------------------------------------------------------------
 
@@ -479,6 +604,9 @@ module.exports = {
   tweetIdFromHref,
   usernameFromHref,
   formatMessage,
+  // Scheduler entrypoint shared with cli.js:
+  startScheduler,
+  validateSchedulerEnv,
 };
 
 // ---------------------------------------------------------------------------
@@ -486,10 +614,7 @@ module.exports = {
 // ---------------------------------------------------------------------------
 
 if (require.main === module) {
-  // Validate required env vars only when running as a script.
-  const missing = [];
-  if (CONFIG.targetAccounts.length === 0) missing.push('TARGET_ACCOUNTS');
-  if (!CONFIG.wahaChannelId) missing.push('WAHA_CHANNEL_ID');
+  const missing = validateSchedulerEnv(CONFIG);
   if (missing.length > 0) {
     // eslint-disable-next-line no-console
     console.error(
@@ -499,79 +624,9 @@ if (require.main === module) {
     process.exit(1);
   }
 
-  const log = getLogger();
-  const dbDeps = getDb();
-
-  let browser = null;
-  let intervalHandle = null;
-  let shuttingDown = false;
-
-  async function shutdown(signal) {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    log.info(`Received ${signal}, shutting down...`);
-    if (intervalHandle) {
-      clearInterval(intervalHandle);
-      intervalHandle = null;
-    }
-    try {
-      if (browser) await browser.close();
-    } catch (err) {
-      log.error(`Error closing browser: ${err.message}`);
-    }
-    try {
-      dbDeps.close();
-    } catch (err) {
-      log.error(`Error closing database: ${err.message}`);
-    }
-    process.exit(0);
-  }
-
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
-  process.on('unhandledRejection', (reason) => {
-    log.error(`Unhandled rejection: ${reason && reason.message ? reason.message : reason}`, {
-      reason: reason && reason.stack ? reason.stack : String(reason),
-    });
+  startScheduler({ once: false }).catch((err) => {
+    // eslint-disable-next-line no-console
+    console.error(`Scheduler failed to start: ${err.message}`);
+    process.exit(1);
   });
-
-  (async () => {
-    log.info('Starting X scraper bot', {
-      targetAccounts: CONFIG.targetAccounts,
-      checkIntervalMinutes: CONFIG.checkIntervalMinutes,
-      headless: CONFIG.headless,
-    });
-
-    const launchOptions = {
-      headless: CONFIG.headless ? 'new' : false,
-      args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-dev-shm-usage',
-      ],
-    };
-    if (CONFIG.puppeteerExecutablePath) {
-      launchOptions.executablePath = CONFIG.puppeteerExecutablePath;
-    }
-
-    try {
-      browser = await puppeteer.launch(launchOptions);
-    } catch (err) {
-      log.error(`Failed to launch puppeteer: ${err.message}`);
-      process.exit(1);
-    }
-
-    // Run once immediately.
-    try {
-      await runCycle(browser);
-    } catch (err) {
-      log.error(`Initial cycle failed: ${err.message}`, { stack: err.stack });
-    }
-
-    intervalHandle = setInterval(() => {
-      runCycle(browser).catch((err) =>
-        log.error(`Cycle failed: ${err.message}`, { stack: err.stack })
-      );
-    }, CONFIG.checkIntervalMinutes * 60 * 1000);
-  })();
 }
