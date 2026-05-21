@@ -124,13 +124,10 @@ function getLogger() {
 const DATA_DIR = path.resolve('./data');
 const DB_PATH = path.join(DATA_DIR, 'bot.db');
 
-function createDb(options) {
-  const opts = options || {};
-  const dbPath = opts.path || ':memory:';
-  const db = new Database(dbPath);
-  db.pragma('journal_mode = WAL');
-
-  db.exec(`
+// Single source of truth for the tweets table schema. Both createDb (initial
+// open) and cli.js's `db reset --confirm` (drop-and-recreate) use this so the
+// two paths cannot drift apart.
+const SCHEMA_SQL = `
     CREATE TABLE IF NOT EXISTS tweets (
       id TEXT PRIMARY KEY,
       username TEXT NOT NULL,
@@ -141,7 +138,15 @@ function createDb(options) {
     );
     CREATE INDEX IF NOT EXISTS idx_tweets_username_created
       ON tweets (username, created_at);
-  `);
+  `;
+
+function createDb(options) {
+  const opts = options || {};
+  const dbPath = opts.path || ':memory:';
+  const db = new Database(dbPath);
+  db.pragma('journal_mode = WAL');
+
+  db.exec(SCHEMA_SQL);
 
   const stmtInsertTweet = db.prepare(
     'INSERT OR IGNORE INTO tweets (id, username, content, tweet_url, posted_to_whatsapp) VALUES (?, ?, ?, ?, 0)'
@@ -516,8 +521,6 @@ async function startScheduler(options) {
   }
 
   if (!once) {
-    process.on('SIGINT', () => shutdown('SIGINT'));
-    process.on('SIGTERM', () => shutdown('SIGTERM'));
     process.on('unhandledRejection', (reason) => {
       log.error(
         `Unhandled rejection: ${reason && reason.message ? reason.message : reason}`,
@@ -525,6 +528,12 @@ async function startScheduler(options) {
       );
     });
   }
+
+  // Install SIGINT/SIGTERM handlers in BOTH modes. Without these, Ctrl+C
+  // during a long page load in `cli.js start --once` would exit without
+  // closing the browser or DB, leaving an orphan chromium process.
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
   log.info('Starting X scraper bot', {
     targetAccounts: config.targetAccounts,
@@ -604,6 +613,8 @@ module.exports = {
   tweetIdFromHref,
   usernameFromHref,
   formatMessage,
+  // Schema source-of-truth shared with cli.js's `db reset --confirm`:
+  SCHEMA_SQL,
   // Scheduler entrypoint shared with cli.js:
   startScheduler,
   validateSchedulerEnv,

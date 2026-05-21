@@ -33,7 +33,13 @@ const {
   scrapeAccount,
   startScheduler,
   validateSchedulerEnv,
+  SCHEMA_SQL,
 } = bot;
+
+// X handle alphabet (mirrors twitter.com's actual rules): letters, digits,
+// underscore, 1-15 chars. Used to reject `accounts add/remove` inputs that
+// would otherwise let an attacker inject newlines or commas into .env.
+const VALID_USERNAME_RE = /^[A-Za-z0-9_]{1,15}$/;
 
 // ---------------------------------------------------------------------------
 // Subcommand implementations - each accepts injected deps for testability.
@@ -104,15 +110,14 @@ async function runScrape(args) {
   }
 
   const config = a.config || DEFAULT_CONFIG;
-  const launcher = a.browserFactory;
-  if (typeof launcher !== 'function') {
-    // Lazy-require puppeteer only when actually launching, so tests that pass
-    // --dry-run never trigger the chromium download / native bindings.
-    // eslint-disable-next-line global-require
-    const puppeteer = require('puppeteer');
-    a.browserFactory = (launchOptions) => puppeteer.launch(launchOptions);
-    return runScrape(a);
-  }
+  const launcher =
+    typeof a.browserFactory === 'function'
+      ? a.browserFactory
+      : // Default: use the puppeteer module that bot.js already loaded.
+        // (No lazy-require dance: bot.js top-level requires puppeteer, so by
+        // the time we reach this branch the module is already in require.cache.)
+        // eslint-disable-next-line global-require
+        ((opts) => require('puppeteer').launch(opts));
 
   const launchOptions = {
     headless: config.headless ? 'new' : false,
@@ -446,6 +451,16 @@ function accountsAdd(args) {
     err.error('accounts add: <username> is required');
     return { code: 1 };
   }
+  if (!VALID_USERNAME_RE.test(username)) {
+    // Reject anything outside X's actual handle alphabet. Without this, a
+    // username containing a newline or comma would inject arbitrary key=value
+    // lines into .env that dotenv would later read as separate env vars.
+    err.error(
+      `accounts add: invalid username ${JSON.stringify(a.username)} ` +
+        '(X handles are 1-15 chars of [A-Za-z0-9_])'
+    );
+    return { code: 1 };
+  }
   if (!fsDep.existsSync(envFile)) {
     err.error(`accounts add: ${envFile} not found - copy .env.example to .env first`);
     return { code: 1 };
@@ -472,6 +487,13 @@ function accountsRemove(args) {
   const username = normalizeAccount(a.username);
   if (!username) {
     err.error('accounts remove: <username> is required');
+    return { code: 1 };
+  }
+  if (!VALID_USERNAME_RE.test(username)) {
+    err.error(
+      `accounts remove: invalid username ${JSON.stringify(a.username)} ` +
+        '(X handles are 1-15 chars of [A-Za-z0-9_])'
+    );
     return { code: 1 };
   }
   if (!fsDep.existsSync(envFile)) {
@@ -534,24 +556,26 @@ function dbReset(args) {
   if (a.db) {
     dbDeps = a.db;
   } else {
+    // Real-path branch: nudge the operator before the destructive DROP.
+    // SQLite WAL mode lets a live scheduler keep its connection open, so the
+    // DROP succeeds but the scheduler's prepared statements start failing on
+    // the next cycle. Detection is unreliable across platforms, so we always
+    // print the warning when running against a real DB file.
+    err.error(
+      `db reset: about to DROP and recreate tweets in ${dbPath}. ` +
+        'If the scheduler is currently running against this DB, stop it first ' +
+        '(Ctrl+C the `node bot.js` / `node cli.js start` process); a live writer ' +
+        'will hit insert/update errors after this.'
+    );
     const dataDir = path.dirname(dbPath);
     if (!fs.existsSync(dataDir)) fs.mkdirSync(dataDir, { recursive: true });
     dbDeps = createDb({ path: dbPath });
   }
   try {
     dbDeps.db.exec('DROP TABLE IF EXISTS tweets;');
-    dbDeps.db.exec(`
-      CREATE TABLE IF NOT EXISTS tweets (
-        id TEXT PRIMARY KEY,
-        username TEXT NOT NULL,
-        content TEXT,
-        tweet_url TEXT,
-        posted_to_whatsapp INTEGER NOT NULL DEFAULT 0,
-        created_at TEXT NOT NULL DEFAULT (datetime('now'))
-      );
-      CREATE INDEX IF NOT EXISTS idx_tweets_username_created
-        ON tweets (username, created_at);
-    `);
+    // Reuse the schema constant from bot.js so this branch cannot drift from
+    // createDb's initial-open schema.
+    dbDeps.db.exec(SCHEMA_SQL);
     if (a.silent !== true) out.log('db reset: tweets table recreated');
     return { code: 0 };
   } finally {
@@ -708,6 +732,7 @@ module.exports = {
   parseAccountsLine,
   readEnvAccounts,
   writeEnvAccounts,
+  VALID_USERNAME_RE,
 };
 
 // ---------------------------------------------------------------------------

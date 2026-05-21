@@ -2,6 +2,8 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
+const fs = require('node:fs');
+const os = require('node:os');
 const path = require('node:path');
 
 const cli = require('../cli.js');
@@ -567,5 +569,283 @@ test('cli.test.js exposes the documented exports', () => {
     'buildProgram',
   ]) {
     assert.equal(typeof cli[name], 'function', `cli.${name} is exported as a function`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Review v1 follow-ups
+// ---------------------------------------------------------------------------
+
+// Issue 7: pin runHealth's request URL to ${wahaUrl}/api/sessions/${wahaSession}.
+test('runHealth hits the documented WAHA path with the configured session', async () => {
+  const calls = [];
+  const http = {
+    get: async (url, opts) => {
+      calls.push({ url, opts });
+      return { status: 200, data: { state: 'CONNECTED' } };
+    },
+  };
+  const config = freshConfig({
+    WAHA_URL: 'http://waha.test:9999',
+    WAHA_SESSION: 'my-session',
+  });
+  const code = await cli.runHealth({ config, http, out: captureSink() });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1);
+  assert.equal(
+    calls[0].url,
+    'http://waha.test:9999/api/sessions/my-session',
+    'health must call ${wahaUrl}/api/sessions/${wahaSession}'
+  );
+  assert.equal(calls[0].opts.timeout, 5000);
+});
+
+// Issue 3: runStart happy path - validation passes -> startScheduler is invoked
+// with the right shape. A regression in the validation->scheduler glue would
+// have slipped through with the prior tests.
+test('runStart invokes startScheduler with {once,config} when env is valid', async () => {
+  const config = freshConfig({
+    TARGET_ACCOUNTS: 'elonmusk,whale_alert',
+    WAHA_CHANNEL_ID: '123@newsletter',
+  });
+  const calls = [];
+  const fakeScheduler = async (opts) => {
+    calls.push(opts);
+  };
+  const code = await cli.runStart({
+    once: true,
+    config,
+    err: captureWritable(),
+    startScheduler: fakeScheduler,
+  });
+  assert.equal(code, 0);
+  assert.equal(calls.length, 1, 'scheduler should be called exactly once');
+  assert.equal(calls[0].once, true);
+  assert.equal(calls[0].config, config, 'config is forwarded by reference');
+});
+
+test('runStart forwards once=false when --once flag absent', async () => {
+  const config = freshConfig({
+    TARGET_ACCOUNTS: 'foo',
+    WAHA_CHANNEL_ID: 'c@newsletter',
+  });
+  const calls = [];
+  const code = await cli.runStart({
+    config,
+    err: captureWritable(),
+    startScheduler: async (opts) => {
+      calls.push(opts);
+    },
+  });
+  assert.equal(code, 0);
+  assert.equal(calls[0].once, false);
+});
+
+// Issue 4: runScrape puppeteer-launch branch (everything past the dry-run
+// guard) had no test coverage. Drive the body with an injected browserFactory
+// and a fake scrapeAccount.
+test('runScrape success path drives browserFactory + scrapeAccount and prints JSON', async () => {
+  const closes = [];
+  const fakeBrowser = {
+    close: async () => {
+      closes.push('browser');
+    },
+  };
+  const factoryCalls = [];
+  const browserFactory = async (launchOptions) => {
+    factoryCalls.push(launchOptions);
+    return fakeBrowser;
+  };
+  const scrapeCalls = [];
+  const fakeScrape = async (browser, username, opts) => {
+    scrapeCalls.push({ browser, username, opts });
+    return [
+      { text: 'one', time: '2024-01-01T00:00:00.000Z', href: 'https://x.com/elonmusk/status/1' },
+      { text: 'two', time: '2024-01-02T00:00:00.000Z', href: 'https://x.com/elonmusk/status/2' },
+      { text: 'three', time: '2024-01-03T00:00:00.000Z', href: 'https://x.com/elonmusk/status/3' },
+    ];
+  };
+  const out = captureSink();
+  const code = await cli.runScrape({
+    username: 'elonmusk',
+    options: { json: true, limit: 2 },
+    config: freshConfig({ HEADLESS: 'true' }),
+    browserFactory,
+    scrapeAccount: fakeScrape,
+    out,
+  });
+  assert.equal(code, 0);
+  assert.equal(factoryCalls.length, 1, 'browserFactory invoked exactly once');
+  assert.ok(Array.isArray(factoryCalls[0].args), 'launch args are an array');
+  assert.ok(
+    factoryCalls[0].args.includes('--no-sandbox'),
+    'no-sandbox flag forwarded to puppeteer'
+  );
+  assert.equal(scrapeCalls.length, 1, 'scrapeAccount invoked exactly once');
+  assert.equal(scrapeCalls[0].browser, fakeBrowser);
+  assert.equal(scrapeCalls[0].username, 'elonmusk');
+  assert.equal(closes.length, 1, 'browser.close() ran in the finally block');
+  // --limit 2 truncates the 3-tweet result.
+  const parsed = JSON.parse(out._lines.log[0]);
+  assert.equal(parsed.length, 2);
+  assert.equal(parsed[0].text, 'one');
+});
+
+test('runScrape success path prints human-readable lines without --json', async () => {
+  const fakeBrowser = { close: async () => {} };
+  const out = captureSink();
+  const code = await cli.runScrape({
+    username: 'whale_alert',
+    options: {},
+    config: freshConfig(),
+    browserFactory: async () => fakeBrowser,
+    scrapeAccount: async () => [
+      { text: 'hello world', time: '2024-01-01T00:00:00.000Z', href: 'https://x.com/whale_alert/status/9' },
+    ],
+    out,
+  });
+  assert.equal(code, 0);
+  const text = out._lines.log.join('\n');
+  assert.match(text, /\[2024-01-01T00:00:00\.000Z\]/);
+  assert.match(text, /https:\/\/x\.com\/whale_alert\/status\/9/);
+  assert.match(text, /hello world/);
+});
+
+test('runScrape closes the browser even when scrapeAccount throws', async () => {
+  let closed = false;
+  const fakeBrowser = {
+    close: async () => {
+      closed = true;
+    },
+  };
+  const err = captureSink();
+  const code = await cli.runScrape({
+    username: 'foo',
+    options: {},
+    config: freshConfig(),
+    browserFactory: async () => fakeBrowser,
+    scrapeAccount: async () => {
+      throw new Error('selector timeout');
+    },
+    out: captureSink(),
+    err,
+  });
+  assert.equal(code, 1);
+  assert.equal(closed, true, 'browser must close on scrape failure');
+  assert.match(err._lines.error.join('\n'), /selector timeout/);
+});
+
+// Issue 1: accounts add must reject usernames that don't match the X handle
+// alphabet, otherwise an embedded \n or , gets written into .env verbatim
+// and dotenv reads the injected lines as separate env vars on next start.
+test('accountsAdd rejects usernames containing newlines (env injection)', () => {
+  const fsMock = memFs({ '.env': 'TARGET_ACCOUNTS=elonmusk\n' });
+  const err = captureSink();
+  const r = cli.accountsAdd({
+    envFile: '.env',
+    fs: fsMock,
+    username: 'foo\nMALICIOUS=1',
+    out: captureSink(),
+    err,
+    silent: true,
+  });
+  assert.equal(r.code, 1);
+  assert.match(err._lines.error.join('\n'), /invalid username/);
+  // .env must be untouched by the rejected add.
+  assert.equal(fsMock.files['.env'], 'TARGET_ACCOUNTS=elonmusk\n');
+});
+
+test('accountsAdd rejects usernames containing commas (account-list injection)', () => {
+  const fsMock = memFs({ '.env': 'TARGET_ACCOUNTS=elonmusk\n' });
+  const err = captureSink();
+  const r = cli.accountsAdd({
+    envFile: '.env',
+    fs: fsMock,
+    username: 'foo,bar',
+    out: captureSink(),
+    err,
+    silent: true,
+  });
+  assert.equal(r.code, 1);
+  assert.match(err._lines.error.join('\n'), /invalid username/);
+  assert.equal(fsMock.files['.env'], 'TARGET_ACCOUNTS=elonmusk\n');
+});
+
+test('accountsAdd rejects usernames longer than 15 characters', () => {
+  const fsMock = memFs({ '.env': 'TARGET_ACCOUNTS=elonmusk\n' });
+  const err = captureSink();
+  const r = cli.accountsAdd({
+    envFile: '.env',
+    fs: fsMock,
+    username: 'a'.repeat(16),
+    err,
+    silent: true,
+  });
+  assert.equal(r.code, 1);
+  assert.match(err._lines.error.join('\n'), /invalid username/);
+});
+
+test('accountsAdd accepts the full X handle alphabet (letters, digits, underscore)', () => {
+  const fsMock = memFs({ '.env': 'TARGET_ACCOUNTS=elonmusk\n' });
+  const r = cli.accountsAdd({
+    envFile: '.env',
+    fs: fsMock,
+    username: 'foo_BAR_42',
+    silent: true,
+  });
+  assert.equal(r.code, 0);
+  assert.deepEqual(r.accounts, ['elonmusk', 'foo_bar_42']);
+});
+
+test('accountsRemove also rejects invalid usernames', () => {
+  const fsMock = memFs({ '.env': 'TARGET_ACCOUNTS=elonmusk,foo\n' });
+  const err = captureSink();
+  const r = cli.accountsRemove({
+    envFile: '.env',
+    fs: fsMock,
+    username: 'foo bar',
+    err,
+    silent: true,
+  });
+  assert.equal(r.code, 1);
+  assert.match(err._lines.error.join('\n'), /invalid username/);
+  // No write happened.
+  assert.equal(fsMock.files['.env'], 'TARGET_ACCOUNTS=elonmusk,foo\n');
+});
+
+// Issue 8: dbReset must use the same schema as createDb. After a reset the
+// idx_tweets_username_created index should still be present.
+test('dbReset --confirm restores the schema index from createDb', () => {
+  const db = inMemoryDb();
+  const r = cli.dbReset({ db, confirm: true, silent: true });
+  assert.equal(r.code, 0);
+  const idx = db.db
+    .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_tweets_username_created'")
+    .get();
+  assert.ok(idx, 'idx_tweets_username_created must exist after reset');
+  db.close();
+});
+
+// Issue 2: dbReset must print a stderr nudge when running against a real DB
+// path so an operator who left the scheduler running gets a clear hint.
+test('dbReset --confirm prints a stop-the-bot warning for the real-path branch', () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dbreset-test-'));
+  const tmpDb = path.join(tmpDir, 'bot.db');
+  const err = captureSink();
+  try {
+    const r = cli.dbReset({
+      confirm: true,
+      dbPath: tmpDb,
+      err,
+      out: captureSink(),
+      silent: true,
+    });
+    assert.equal(r.code, 0);
+    const errText = err._lines.error.join('\n');
+    assert.match(errText, /scheduler/i, 'warning mentions the scheduler');
+    assert.match(errText, /stop it first/i, 'warning tells the operator to stop the bot');
+    assert.ok(errText.includes(tmpDb), 'warning includes the actual db path');
+  } finally {
+    fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
