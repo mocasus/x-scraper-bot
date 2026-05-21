@@ -163,7 +163,7 @@ async function testScraper() {
 
     console.log('\n✅ Scraper test passed!');
     console.log('Browser akan ditutu dalam 5 detik...');
-    await page.waitForrTimeout(5000);
+    await page.waitForTimeout(5000);
 
   } catch (error) {
     console.error('❌ Scraper test failed:', error.message);
