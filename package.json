@@ -3,6 +3,7 @@
   "version": "1.0.0",
   "description": "Simple X/Twitter Scraper to WhatsApp Channel",
   "main": "bot.js",
+  "license": "MIT",
   "bin": {
     "x-scraper": "./cli.js"
   },
