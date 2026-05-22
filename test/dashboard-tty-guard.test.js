@@ -109,3 +109,64 @@ test('runDashboard returnHandle path constructs the screen and returns a usable 
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// (3) v1 review fix 6: signal handlers must not accumulate across runs.
+//     Each runDashboard registers a SIGINT/SIGTERM handler; cleanup() is
+//     responsible for removing them. A regression here would surface as a
+//     growing process.listenerCount('SIGINT') after every run.
+// ---------------------------------------------------------------------------
+
+test('runDashboard cleanup() removes its SIGINT/SIGTERM listeners', async () => {
+  const tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'dashboard-signals-'));
+  const logFile = path.join(tmpDir, 'bot.log');
+  fs.writeFileSync(logFile, '', 'utf8');
+
+  const stubScreen = {
+    key: () => {},
+    on: () => {},
+    render: () => {},
+    destroy: () => {},
+  };
+  const db = inMemoryDb();
+  const config = freshConfig({ TARGET_ACCOUNTS: 'a' });
+  const http = { get: async () => ({ status: 200, data: { state: 'CONNECTED' } }) };
+
+  const sigintBefore = process.listenerCount('SIGINT');
+  const sigtermBefore = process.listenerCount('SIGTERM');
+
+  try {
+    // Drive three independent runs back-to-back. Without cleanup removing
+    // its listeners, listenerCount would grow by 3 per signal.
+    for (let i = 0; i < 3; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      const handle = await runDashboard({
+        stdout: { isTTY: true },
+        stderr: { write: () => true },
+        config,
+        http,
+        db,
+        logFile,
+        refreshSeconds: 60,
+        returnHandle: true,
+        skipUi: true,
+        screenFactory: () => stubScreen,
+      });
+      handle.cleanup();
+    }
+
+    assert.equal(
+      process.listenerCount('SIGINT'),
+      sigintBefore,
+      'SIGINT listener count must not grow across runs'
+    );
+    assert.equal(
+      process.listenerCount('SIGTERM'),
+      sigtermBefore,
+      'SIGTERM listener count must not grow across runs'
+    );
+  } finally {
+    try { db.close(); } catch (_) { /* may already be closed */ }
+    fs.rmSync(tmpDir, { recursive: true, force: true });
+  }
+});

@@ -202,6 +202,11 @@ async function runDashboard(opts) {
       try { fs.mkdirSync(dataDir, { recursive: true }); } catch (_e) { /* ignore */ }
     }
     dbDeps = bot.createDb({ path: dbPath });
+    // Set a busy_timeout so a refresh tick that races a bot.js writer
+    // doesn't surface as `refresh: db error` and a stale panel until the
+    // next interval. Wrapped in try/catch because the test path injects
+    // a fake `db` shape that may not expose `.db.pragma`.
+    try { dbDeps.db.pragma('busy_timeout = 5000'); } catch (_e) { /* ignore */ }
     ownDb = true;
   }
 
@@ -216,157 +221,38 @@ async function runDashboard(opts) {
   const startedAt = now();
   const dataDeps = { db: dbDeps, http, config, now, startedAt };
 
-  // (4) Construct screen + widgets.
-  const screenFactory = typeof o.screenFactory === 'function'
-    ? o.screenFactory
-    : defaultScreenFactory;
-  const screen = screenFactory();
-
+  // (4) Forward-declare resources that cleanup() may need to release. They
+  //     are populated inside the construction try-block below; cleanup is
+  //     safe to call before any of them are wired (every release is guarded
+  //     by a null check + try/catch).
+  let screen = null;
   let widgets = null;
-  if (!skipUi) {
-    const builder = typeof o.buildUi === 'function' ? o.buildUi : defaultBuildUi;
-    widgets = builder(screen, { config });
-  }
-
-  // (5) Ring buffer for the log box - the 'c' keybind clears the on-screen
-  //     view without truncating the source file.
-  const ringBuffer = [];
-  function pushLog(line) {
-    ringBuffer.push(line);
-    if (ringBuffer.length > 200) ringBuffer.shift();
-    if (widgets && widgets.logBox && typeof widgets.logBox.log === 'function') {
-      try { widgets.logBox.log(line); } catch (_e) { /* ignore */ }
-    }
-  }
-
-  function safeRender() {
-    try { screen.render(); } catch (_e) { /* ignore */ }
-  }
-
-  // (6) refreshAll - one async pass over every data getter.
-  async function refreshAll() {
-    let status;
-    try {
-      status = await dataModule.getStatus(dataDeps);
-    } catch (e) {
-      pushLog(`{red-fg}refresh: status error ${e.message}{/red-fg}`);
-      status = { waha: { state: 'UNREACHABLE', color: 'red' }, uptimeSeconds: 0 };
-    }
-    let today;
-    let hist;
-    let accounts;
-    let recent;
-    try {
-      today = dataModule.getTodayStats(dataDeps);
-      hist = dataModule.getHourlyHistogram(dataDeps);
-      accounts = dataModule.getAccountsWithLastSeen(dataDeps);
-      recent = dataModule.getRecentTweets(dataDeps, 10);
-    } catch (e) {
-      pushLog(`{red-fg}refresh: db error ${e.message}{/red-fg}`);
-      return;
-    }
-
-    if (!widgets) return;
-
-    const wahaColor = status.waha.color || 'gray';
-    const wahaState = status.waha.state || 'UNKNOWN';
-    const uptime = formatUptime(status.uptimeSeconds);
-    const accountsConfigured = (config.targetAccounts || []).length;
-
-    widgets.statusBox.setContent(
-      ` {bold}WAHA{/bold}    {${wahaColor}-fg}${wahaState}{/${wahaColor}-fg}\n` +
-      ` Accounts {bold}${accountsConfigured}{/bold}\n` +
-      ` Uptime  ${uptime}`
-    );
-    widgets.statsBox.setContent(
-      ` Scraped {bold}${today.scraped}{/bold}\n` +
-      ` Posted  {bold}${today.posted}{/bold}\n` +
-      ` Pending {bold}${today.errors}{/bold}`
-    );
-
-    try {
-      widgets.histChart.setData([
-        { title: 'tweets', x: hist.hours, y: hist.counts, style: { line: 'yellow' } },
-      ]);
-    } catch (_e) { /* ignore chart sizing errors on tiny terminals */ }
-
-    try {
-      const nowDate = now();
-      widgets.accountsTable.setData({
-        headers: ['username', 'last seen'],
-        data: accounts.map((a) => [
-          `@${a.username}`,
-          render.formatRelativeTime(a.lastSeen, nowDate),
-        ]),
-      });
-    } catch (_e) { /* ignore */ }
-
-    try {
-      const nowDate = now();
-      widgets.recentTable.setData({
-        headers: ['', 'when', 'tweet'],
-        data: recent.map((t) => [
-          t.posted_to_whatsapp ? 'OK' : '--',
-          `@${t.username} ${render.formatRelativeTime(t.created_at, nowDate)}`,
-          render.truncate(String(t.content || '').replace(/\s+/g, ' '), 60),
-        ]),
-      });
-    } catch (_e) { /* ignore */ }
-
-    safeRender();
-  }
-
-  // (7) Run an initial refresh; then schedule the slow + fast intervals.
-  await refreshAll();
-
-  const refreshHandle = setInterval(() => {
-    refreshAll();
-  }, refreshSeconds * 1000);
-  // Bump uptime cell every second without re-running every getter.
-  const uptimeHandle = setInterval(() => {
-    if (!widgets) return;
-    const wahaState = (widgets._lastWahaState && widgets._lastWahaState) || '';
-    void wahaState;
-    const uptime = formatUptime(
-      Math.floor((now().getTime() - startedAt.getTime()) / 1000)
-    );
-    try {
-      // Replace the last line of the status box content with the live uptime.
-      const current = widgets.statusBox.getContent ? widgets.statusBox.getContent() : '';
-      const lines = String(current).split('\n');
-      const idx = lines.findIndex((l) => /Uptime/.test(l));
-      if (idx >= 0) {
-        lines[idx] = ` Uptime  ${uptime}`;
-        widgets.statusBox.setContent(lines.join('\n'));
-        safeRender();
-      }
-    } catch (_e) { /* ignore */ }
-  }, 1000);
-
-  // (8) Log tailer.
-  const tailHandle = logTailModule.tailLog(logFile, (line) => {
-    pushLog(formatLogRecord(line));
-    safeRender();
-  });
-
-  // (9) Cleanup - idempotent, safe to call from any code path.
+  let refreshHandle = null;
+  let uptimeHandle = null;
+  let tailHandle = null;
   let cleaned = false;
+
+  let shutdownResolve;
+  const shutdownPromise = new Promise((resolve) => { shutdownResolve = resolve; });
+
+  // Cleanup is idempotent and safe to call from any code path, including
+  // a mid-construction throw before screen/widgets/intervals are assigned.
   function cleanup() {
     if (cleaned) return;
     cleaned = true;
-    try { clearInterval(refreshHandle); } catch (_e) { /* ignore */ }
-    try { clearInterval(uptimeHandle); } catch (_e) { /* ignore */ }
-    try { tailHandle.stop(); } catch (_e) { /* ignore */ }
+    try { if (refreshHandle) clearInterval(refreshHandle); } catch (_e) { /* ignore */ }
+    try { if (uptimeHandle) clearInterval(uptimeHandle); } catch (_e) { /* ignore */ }
+    try { if (tailHandle) tailHandle.stop(); } catch (_e) { /* ignore */ }
     if (ownDb) {
       try { dbDeps.close(); } catch (_e) { /* ignore */ }
     }
-    try { screen.destroy(); } catch (_e) { /* ignore */ }
+    try { if (screen) screen.destroy(); } catch (_e) { /* ignore */ }
+    // Drop our process-level signal subscriptions so a second runDashboard
+    // (test reruns, repeated subcommand invocations) does not stack handlers
+    // referencing this run's dead closures.
+    try { process.removeListener('SIGINT', sigintHandler); } catch (_e) { /* ignore */ }
+    try { process.removeListener('SIGTERM', sigtermHandler); } catch (_e) { /* ignore */ }
   }
-
-  // (10) Resolution: returnHandle short-circuits, otherwise the function
-  //      stays pending until 'q' / Ctrl+C / SIGINT triggers shutdown.
-  let shutdownResolve;
-  const shutdownPromise = new Promise((resolve) => { shutdownResolve = resolve; });
 
   function gracefulShutdown(code) {
     cleanup();
@@ -380,176 +266,345 @@ async function runDashboard(opts) {
     }
   }
 
-  // (11) Keybindings. The stub screens used by tests provide a no-op
-  //      key()/on() so these calls are harmless there.
-  function spawnScrape() {
-    const targets = (config.targetAccounts || []);
-    const username = targets[0];
-    if (!username) {
-      pushLog('{yellow-fg}[scrape] no TARGET_ACCOUNTS configured{/yellow-fg}');
-      safeRender();
-      return;
+  // Register signal handlers up front (before screenFactory) so a throw
+  // mid-construction still triggers cleanup. Use process.on plus an
+  // explicit removeListener inside cleanup so re-entrant runs do not
+  // stack handlers indefinitely.
+  const sigintHandler = () => gracefulShutdown(0);
+  const sigtermHandler = () => gracefulShutdown(0);
+  process.on('SIGINT', sigintHandler);
+  process.on('SIGTERM', sigtermHandler);
+
+  // (5) Construction block. Anything that throws between screenFactory()
+  //     and the keybind/signal wiring runs cleanup() before propagating,
+  //     so neither the DB nor the screen leaks on a partial init.
+  try {
+    const screenFactory = typeof o.screenFactory === 'function'
+      ? o.screenFactory
+      : defaultScreenFactory;
+    screen = screenFactory();
+
+    if (!skipUi) {
+      const builder = typeof o.buildUi === 'function' ? o.buildUi : defaultBuildUi;
+      widgets = builder(screen, { config });
     }
-    pushLog(`{cyan-fg}[scrape] starting node cli.js scrape ${username} --json --limit 5{/cyan-fg}`);
-    safeRender();
-    let child;
-    try {
-      child = child_process.spawn(
+
+    // (6) Ring buffer for the log box - the 'c' keybind clears the on-screen
+    //     view without truncating the source file.
+    const ringBuffer = [];
+    function pushLog(line) {
+      ringBuffer.push(line);
+      if (ringBuffer.length > 200) ringBuffer.shift();
+      if (widgets && widgets.logBox && typeof widgets.logBox.log === 'function') {
+        try { widgets.logBox.log(line); } catch (_e) { /* ignore */ }
+      }
+    }
+
+    function safeRender() {
+      try { screen.render(); } catch (_e) { /* ignore */ }
+    }
+
+    // (7) refreshAll - one async pass over every data getter.
+    async function refreshAll() {
+      let status;
+      try {
+        status = await dataModule.getStatus(dataDeps);
+      } catch (e) {
+        pushLog(`{red-fg}refresh: status error ${e.message}{/red-fg}`);
+        status = { waha: { state: 'UNREACHABLE', color: 'red' }, uptimeSeconds: 0 };
+      }
+      let today;
+      let hist;
+      let accounts;
+      let recent;
+      try {
+        today = dataModule.getTodayStats(dataDeps);
+        hist = dataModule.getHourlyHistogram(dataDeps);
+        accounts = dataModule.getAccountsWithLastSeen(dataDeps);
+        recent = dataModule.getRecentTweets(dataDeps, 10);
+      } catch (e) {
+        pushLog(`{red-fg}refresh: db error ${e.message}{/red-fg}`);
+        return;
+      }
+
+      if (!widgets) return;
+
+      const wahaColor = status.waha.color || 'gray';
+      const wahaState = status.waha.state || 'UNKNOWN';
+      const uptime = formatUptime(status.uptimeSeconds);
+      const accountsConfigured = (config.targetAccounts || []).length;
+
+      try {
+        widgets.statusBox.setContent(
+          ` {bold}WAHA{/bold}    {${wahaColor}-fg}${wahaState}{/${wahaColor}-fg}\n` +
+          ` Accounts {bold}${accountsConfigured}{/bold}\n` +
+          ` Uptime  ${uptime}`
+        );
+      } catch (_e) { /* ignore widget setContent errors on partial UI */ }
+      try {
+        widgets.statsBox.setContent(
+          ` Scraped {bold}${today.scraped}{/bold}\n` +
+          ` Posted  {bold}${today.posted}{/bold}\n` +
+          ` Pending {bold}${today.errors}{/bold}`
+        );
+      } catch (_e) { /* ignore */ }
+
+      try {
+        widgets.histChart.setData([
+          { title: 'tweets', x: hist.hours, y: hist.counts, style: { line: 'yellow' } },
+        ]);
+      } catch (_e) { /* ignore chart sizing errors on tiny terminals */ }
+
+      try {
+        const nowDate = now();
+        widgets.accountsTable.setData({
+          headers: ['username', 'last seen'],
+          data: accounts.map((a) => [
+            `@${a.username}`,
+            render.formatRelativeTime(a.lastSeen, nowDate),
+          ]),
+        });
+      } catch (_e) { /* ignore */ }
+
+      try {
+        const nowDate = now();
+        widgets.recentTable.setData({
+          headers: ['', 'when', 'tweet'],
+          data: recent.map((t) => [
+            t.posted_to_whatsapp ? 'OK' : '--',
+            `@${t.username} ${render.formatRelativeTime(t.created_at, nowDate)}`,
+            render.truncate(String(t.content || '').replace(/\s+/g, ' '), 60),
+          ]),
+        });
+      } catch (_e) { /* ignore */ }
+
+      safeRender();
+    }
+
+    // (8) Run an initial refresh; then schedule the slow + fast intervals.
+    await refreshAll();
+
+    refreshHandle = setInterval(() => {
+      refreshAll();
+    }, refreshSeconds * 1000);
+    // Bump uptime cell every second without re-running every getter.
+    uptimeHandle = setInterval(() => {
+      if (!widgets) return;
+      const wahaState = (widgets._lastWahaState && widgets._lastWahaState) || '';
+      void wahaState;
+      const uptime = formatUptime(
+        Math.floor((now().getTime() - startedAt.getTime()) / 1000)
+      );
+      try {
+        // Replace the last line of the status box content with the live uptime.
+        const current = widgets.statusBox.getContent ? widgets.statusBox.getContent() : '';
+        const lines = String(current).split('\n');
+        const idx = lines.findIndex((l) => /Uptime/.test(l));
+        if (idx >= 0) {
+          lines[idx] = ` Uptime  ${uptime}`;
+          widgets.statusBox.setContent(lines.join('\n'));
+          safeRender();
+        }
+      } catch (_e) { /* ignore */ }
+    }, 1000);
+
+    // (9) Log tailer.
+    tailHandle = logTailModule.tailLog(logFile, (line) => {
+      pushLog(formatLogRecord(line));
+      safeRender();
+    });
+
+    // (10) Keybindings. The stub screens used by tests provide a no-op
+    //      key()/on() so these calls are harmless there.
+    //
+    // Single-flight guard for the spawn-scrape child: a second `s` press
+    // while a previous run is in flight is logged and ignored rather than
+    // racing two parallel scrapes through the log pane.
+    let scrapeChild = null;
+    function spawnScrape() {
+      const targets = (config.targetAccounts || []);
+      const username = targets[0];
+      if (!username) {
+        pushLog('{yellow-fg}[scrape] no TARGET_ACCOUNTS configured{/yellow-fg}');
+        safeRender();
+        return;
+      }
+      if (scrapeChild) {
+        pushLog('{yellow-fg}[scrape] already running, ignoring{/yellow-fg}');
+        safeRender();
+        return;
+      }
+      pushLog(`{cyan-fg}[scrape] starting node cli.js scrape ${username} --json --limit 5{/cyan-fg}`);
+      safeRender();
+      // child_process.spawn does not throw synchronously for ENOENT and
+      // friends; those surface on the 'error' event below.
+      const child = child_process.spawn(
         process.execPath,
         ['cli.js', 'scrape', username, '--json', '--limit', '5'],
         { cwd, stdio: ['ignore', 'pipe', 'pipe'] }
       );
-    } catch (e) {
-      pushLog(`{red-fg}[scrape] spawn failed: ${e.message}{/red-fg}`);
-      safeRender();
-      return;
-    }
-    function pipeLines(stream, prefix) {
-      let leftover = '';
-      stream.setEncoding('utf8');
-      stream.on('data', (chunk) => {
-        leftover += chunk;
-        const parts = leftover.split('\n');
-        leftover = parts.pop();
-        for (const l of parts) {
-          if (l) pushLog(`${prefix} ${l}`);
-        }
+      child.on('error', (e) => {
+        pushLog(`{red-fg}[scrape] error: ${e.message}{/red-fg}`);
         safeRender();
       });
-      stream.on('end', () => {
-        if (leftover) pushLog(`${prefix} ${leftover}`);
+      scrapeChild = child;
+      function pipeLines(stream, prefix) {
+        let leftover = '';
+        stream.setEncoding('utf8');
+        stream.on('data', (chunk) => {
+          leftover += chunk;
+          const parts = leftover.split('\n');
+          leftover = parts.pop();
+          for (const l of parts) {
+            if (l) pushLog(`${prefix} ${l}`);
+          }
+          safeRender();
+        });
+        stream.on('end', () => {
+          if (leftover) pushLog(`${prefix} ${leftover}`);
+          safeRender();
+        });
+      }
+      pipeLines(child.stdout, '[scrape]');
+      pipeLines(child.stderr, '{yellow-fg}[scrape:err]{/yellow-fg}');
+      child.on('close', (code) => {
+        scrapeChild = null;
+        pushLog(`[scrape] exited code=${code}`);
         safeRender();
       });
     }
-    pipeLines(child.stdout, '[scrape]');
-    pipeLines(child.stderr, '{yellow-fg}[scrape:err]{/yellow-fg}');
-    child.on('close', (code) => {
-      pushLog(`[scrape] exited code=${code}`);
-      safeRender();
-    });
-  }
 
-  function clearLogs() {
-    ringBuffer.length = 0;
-    if (widgets && widgets.logBox) {
+    function clearLogs() {
+      ringBuffer.length = 0;
+      if (widgets && widgets.logBox) {
+        try {
+          if (typeof widgets.logBox.logLines !== 'undefined') widgets.logBox.logLines = [];
+          if (typeof widgets.logBox.setItems === 'function') widgets.logBox.setItems([]);
+          if (typeof widgets.logBox.setContent === 'function') widgets.logBox.setContent('');
+        } catch (_e) { /* ignore */ }
+      }
+      safeRender();
+    }
+
+    function showHelp() {
+      if (!widgets) return;
+      // eslint-disable-next-line global-require
+      const blessed = require('blessed');
       try {
-        if (typeof widgets.logBox.logLines !== 'undefined') widgets.logBox.logLines = [];
-        if (typeof widgets.logBox.setItems === 'function') widgets.logBox.setItems([]);
-        if (typeof widgets.logBox.setContent === 'function') widgets.logBox.setContent('');
-      } catch (_e) { /* ignore */ }
-    }
-    safeRender();
-  }
-
-  function showHelp() {
-    if (!widgets) return;
-    // eslint-disable-next-line global-require
-    const blessed = require('blessed');
-    try {
-      const help = blessed.message({
-        parent: screen,
-        border: 'line',
-        height: 'shrink',
-        width: 'half',
-        top: 'center',
-        left: 'center',
-        label: ' Help ',
-        tags: true,
-        keys: true,
-        hidden: true,
-        vi: true,
-      });
-      help.display(
-        '{bold}Keybindings{/bold}\n\n' +
-          '  q, Ctrl+C   quit\n' +
-          '  r           refresh now\n' +
-          '  s           spawn scrape for first TARGET_ACCOUNT\n' +
-          '  a           add/remove an account\n' +
-          '  c           clear log panel (file is untouched)\n' +
-          '  ?, h        this help\n' +
-          '  arrows      scroll log panel',
-        0,
-        () => {}
-      );
-      safeRender();
-    } catch (e) {
-      pushLog(`{red-fg}help: ${e.message}{/red-fg}`);
-    }
-  }
-
-  function promptAccount() {
-    if (!widgets) return;
-    // eslint-disable-next-line global-require
-    const blessed = require('blessed');
-    // Lazy-require cli.js for accountsAdd/accountsRemove to avoid a require
-    // cycle (cli.js does not require ./dashboard at module load time).
-    // eslint-disable-next-line global-require
-    const cli = require('../cli.js');
-    try {
-      const action = blessed.prompt({
-        parent: screen,
-        border: 'line',
-        height: 'shrink',
-        width: 'half',
-        top: 'center',
-        left: 'center',
-        label: ' accounts ',
-        tags: true,
-        keys: true,
-        vi: true,
-      });
-      action.input('add or remove?', '', (errA, value) => {
-        if (errA || !value) { safeRender(); return; }
-        const verb = String(value).trim().toLowerCase();
-        const handler = verb.startsWith('r') ? cli.accountsRemove : cli.accountsAdd;
-        const usernamePrompt = blessed.prompt({
+        const help = blessed.message({
           parent: screen,
           border: 'line',
           height: 'shrink',
           width: 'half',
           top: 'center',
           left: 'center',
-          label: ' username ',
+          label: ' Help ',
+          tags: true,
+          keys: true,
+          hidden: true,
+          vi: true,
+        });
+        help.display(
+          '{bold}Keybindings{/bold}\n\n' +
+            '  q, Ctrl+C   quit\n' +
+            '  r           refresh now\n' +
+            '  s           spawn scrape for first TARGET_ACCOUNT\n' +
+            '  a           add/remove an account\n' +
+            '  c           clear log panel (file is untouched)\n' +
+            '  ?, h        this help\n' +
+            '  arrows      scroll log panel',
+          0,
+          () => {}
+        );
+        safeRender();
+      } catch (e) {
+        pushLog(`{red-fg}help: ${e.message}{/red-fg}`);
+      }
+    }
+
+    function promptAccount() {
+      if (!widgets) return;
+      // eslint-disable-next-line global-require
+      const blessed = require('blessed');
+      // Lazy-require cli.js for accountsAdd/accountsRemove to avoid a require
+      // cycle (cli.js does not require ./dashboard at module load time).
+      // eslint-disable-next-line global-require
+      const cli = require('../cli.js');
+      try {
+        const action = blessed.prompt({
+          parent: screen,
+          border: 'line',
+          height: 'shrink',
+          width: 'half',
+          top: 'center',
+          left: 'center',
+          label: ' accounts ',
           tags: true,
           keys: true,
           vi: true,
         });
-        usernamePrompt.input('username (without @)', '', (errU, uname) => {
-          if (errU || !uname) { safeRender(); return; }
-          const r = handler({ username: String(uname).trim(), silent: true });
-          pushLog(
-            `{cyan-fg}[accounts] ${verb.startsWith('r') ? 'remove' : 'add'} ${uname} -> code=${r.code}{/cyan-fg}`
-          );
-          // Refresh the accounts panel - lastSeen may have shifted.
-          refreshAll();
+        action.input('add or remove?', '', (errA, value) => {
+          if (errA || !value) { safeRender(); return; }
+          const verb = String(value).trim().toLowerCase();
+          const handler = verb.startsWith('r') ? cli.accountsRemove : cli.accountsAdd;
+          const usernamePrompt = blessed.prompt({
+            parent: screen,
+            border: 'line',
+            height: 'shrink',
+            width: 'half',
+            top: 'center',
+            left: 'center',
+            label: ' username ',
+            tags: true,
+            keys: true,
+            vi: true,
+          });
+          usernamePrompt.input('username (without @)', '', (errU, uname) => {
+            if (errU || !uname) { safeRender(); return; }
+            // Route the cli handler's stdout/stderr into the dashboard's
+            // log pane. `silent:true` only suppresses success/info lines;
+            // without explicit err/out sinks the failure paths still hit
+            // console.error and tear blessed's frame.
+            const r = handler({
+              username: String(uname).trim(),
+              silent: true,
+              err: { error: (msg) => pushLog(`{red-fg}[accounts] ${msg}{/red-fg}`) },
+              out: { log: (msg) => pushLog(`[accounts] ${msg}`) },
+            });
+            pushLog(
+              `{cyan-fg}[accounts] ${verb.startsWith('r') ? 'remove' : 'add'} ${uname} -> code=${r.code}{/cyan-fg}`
+            );
+            // Pull the new account list back into the in-memory config so
+            // the accounts panel reflects the change without a restart.
+            if (r.code === 0 && Array.isArray(r.accounts)) {
+              config.targetAccounts = r.accounts;
+            }
+            // Refresh the accounts panel - lastSeen may have shifted.
+            refreshAll();
+          });
         });
-      });
-      safeRender();
-    } catch (e) {
-      pushLog(`{red-fg}accounts prompt: ${e.message}{/red-fg}`);
+        safeRender();
+      } catch (e) {
+        pushLog(`{red-fg}accounts prompt: ${e.message}{/red-fg}`);
+      }
     }
-  }
 
-  if (typeof screen.key === 'function') {
-    screen.key(['q', 'C-c'], () => gracefulShutdown(0));
-    screen.key(['r'], () => { refreshAll(); });
-    screen.key(['s'], () => { spawnScrape(); });
-    screen.key(['a'], () => { promptAccount(); });
-    screen.key(['c'], () => { clearLogs(); });
-    screen.key(['?', 'h'], () => { showHelp(); });
-  }
+    if (typeof screen.key === 'function') {
+      screen.key(['q', 'C-c'], () => gracefulShutdown(0));
+      screen.key(['r'], () => { refreshAll(); });
+      screen.key(['s'], () => { spawnScrape(); });
+      screen.key(['a'], () => { promptAccount(); });
+      screen.key(['c'], () => { clearLogs(); });
+      screen.key(['?', 'h'], () => { showHelp(); });
+    }
 
-  if (typeof screen.on === 'function') {
-    screen.on('resize', () => { safeRender(); });
+    if (typeof screen.on === 'function') {
+      screen.on('resize', () => { safeRender(); });
+    }
+  } catch (e) {
+    cleanup();
+    throw e;
   }
-
-  // (12) Wire SIGINT/SIGTERM. We use process.once so re-entrant runs
-  //      (tests, repeated subcommand invocations in the same process)
-  //      do not stack handlers indefinitely.
-  const sigintHandler = () => gracefulShutdown(0);
-  const sigtermHandler = () => gracefulShutdown(0);
-  process.once('SIGINT', sigintHandler);
-  process.once('SIGTERM', sigtermHandler);
 
   if (o.returnHandle) {
     return { cleanup, shutdown: gracefulShutdown };

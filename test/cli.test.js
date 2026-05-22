@@ -943,5 +943,57 @@ test('dashboard subcommand registration exposes --refresh on the subcommand obje
   assert.deepEqual(sub.aliases(), ['tui'], 'tui is the alias');
   const refreshOpt = sub.options.find((o) => o.long === '--refresh');
   assert.ok(refreshOpt, '--refresh option is registered');
-  assert.equal(refreshOpt.defaultValue, '15', '--refresh defaults to 15');
+  assert.equal(refreshOpt.defaultValue, 15, '--refresh defaults to 15');
+});
+
+// v1 review fix 7: --refresh runs through a commander custom parser, so
+// non-numeric values fail loud at parse time instead of silently falling
+// back to the runDashboard NaN-coercion default of 15.
+test('dashboard subcommand rejects --refresh abc with a commander error', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    // Commander's exitOverride does not propagate to subcommands; the
+    // dashboard option parser error fires on the subcommand itself, so we
+    // also override exit there to keep node:test from receiving a real
+    // process.exit(1).
+    for (const sub of program.commands) sub.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    let caught = null;
+    try {
+      await program.parseAsync(['dashboard', '--refresh', 'abc'], { from: 'user' });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, '--refresh abc should throw under exitOverride');
+    assert.equal(caught.code, 'commander.invalidArgument');
+    assert.match(caught.message, /positive integer/);
+    assert.equal(calls.length, 0, 'runDashboard must not run when --refresh is invalid');
+  });
+});
+
+test('dashboard subcommand rejects --refresh 0 (must be at least 1)', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    for (const sub of program.commands) sub.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    let caught = null;
+    try {
+      await program.parseAsync(['dashboard', '--refresh', '0'], { from: 'user' });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, '--refresh 0 should throw under exitOverride');
+    assert.equal(caught.code, 'commander.invalidArgument');
+    assert.equal(calls.length, 0);
+  });
 });
