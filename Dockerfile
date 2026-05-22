@@ -35,7 +35,7 @@ COPY package*.json ./
 RUN npm ci --only-production
 
 # Copy app files
-COPY bot.js test.js ./
+COPY bot.js cli.js ./
 
 # Create directories
 RUN mkdir -p data logs

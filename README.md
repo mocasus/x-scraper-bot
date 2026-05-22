@@ -92,6 +92,148 @@ Note: when running on the host (not in Docker), Puppeteer downloads its own
 Chromium build the first time. If you prefer a system Chromium, set
 `PUPPETEER_EXECUTABLE_PATH` in your shell.
 
+## CLI
+
+The repo ships an ops CLI at `cli.js` that wraps the same env, logger, and
+SQLite handles the scheduler uses. The three equivalent ways to run it:
+
+```bash
+npx x-scraper start           # after `npm install` wires the bin
+node cli.js start             # direct invocation
+npm run cli -- start          # via the npm-script wrapper
+```
+
+`node bot.js` (and `npm start`) remain the canonical scheduler entrypoint and
+are unchanged; the CLI is additive.
+
+### CLI reference
+
+| Command | Description | Flags |
+| --- | --- | --- |
+| `start` | Run the scrape -> WAHA scheduler. Validates `TARGET_ACCOUNTS` and `WAHA_CHANNEL_ID` first. | `--once` (run a single cycle then exit) |
+| `scrape <username>` | Open one X profile in puppeteer and print the scraped tweets. Does not touch the DB or WAHA. | `--limit <n>`, `--json`, `--dry-run` |
+| `send <text>` | Send a one-off text to the configured WAHA channel. | `--channel <id>` (override `WAHA_CHANNEL_ID`) |
+| `health` | GET `${WAHA_URL}/api/sessions/${WAHA_SESSION}`; exit 0 only when `state=CONNECTED`. | `--json` |
+| `stats` | Print SQLite tweet counts and the 5 most recent rows from `./data/bot.db`. | `--json` |
+| `logs` | Pretty-print the last N JSON-line records from `./logs/bot.log`. | `-n, --lines <n>` (default 50), `-f, --follow` |
+| `accounts list` | Print the parsed `TARGET_ACCOUNTS` list from `.env`. | (none) |
+| `accounts add <username>` | Append a username to `TARGET_ACCOUNTS` in `.env` (deduplicated, case-insensitive). | (none) |
+| `accounts remove <username>` | Drop a username from `TARGET_ACCOUNTS` in `.env` (case-insensitive). | (none) |
+| `db migrate` | Ensure the `tweets` table exists. Idempotent. | (none) |
+| `db reset` | Drop and recreate the `tweets` table. Refuses without `--confirm`. | `--confirm` |
+| `dashboard` | Open the TUI dashboard for live monitoring. Requires a TTY. Alias: `tui`. | `--refresh <seconds>` (default `15`) |
+
+### CLI examples
+
+```bash
+# Run a single scrape -> post cycle and exit
+node cli.js start --once
+
+# Scrape one account and inspect the JSON output without touching the DB or WAHA
+node cli.js scrape elonmusk --json --dry-run
+node cli.js scrape elonmusk --json --limit 3
+
+# Smoke-test the WAHA session
+node cli.js health
+node cli.js health --json
+
+# Show DB stats and recent rows
+node cli.js stats
+
+# Edit your watchlist without re-opening .env
+node cli.js accounts list
+node cli.js accounts add whale_alert
+node cli.js accounts remove cryptoanalyst
+
+# Wipe the dedup table after a failed first run
+node cli.js db reset --confirm
+```
+
+## Testing
+
+```bash
+npm test                # runs node --test against test/**/*.test.js
+npm run test:coverage   # same suite with --experimental-test-coverage
+```
+
+The suite never opens a real network socket, never launches puppeteer, and
+never writes to `./data/bot.db` or `./logs/bot.log` (it uses `:memory:`
+SQLite and `os.tmpdir()` log files). It is safe to run with no `.env`
+file present:
+
+```bash
+node --check bot.js
+node --check cli.js
+TARGET_ACCOUNTS=elonmusk WAHA_CHANNEL_ID=123@newsletter \
+  node -e "console.log(Object.keys(require('./bot.js')).sort().join(','))"
+```
+
+## Dashboard
+
+The `dashboard` subcommand opens a developer TUI on top of the same SQLite
+database and JSON-line log file the scheduler reads. It is observer-mode: it
+does not start the scraper, post to WAHA, or mutate the DB. You can run it
+concurrently with `node bot.js` because SQLite is opened in WAL mode and the
+log file is tailed read-only.
+
+```bash
+npm run dashboard                       # equivalent to: node cli.js dashboard
+node cli.js dashboard --refresh 5       # refresh panels every 5 seconds
+node cli.js tui                         # short alias
+```
+
+The dashboard requires a real TTY. If `stdout` is not a TTY (when piped to a
+file, run inside CI, or invoked over a non-interactive SSH session) the
+process prints `dashboard requires a TTY (run from an interactive terminal;
+not pipeable)` to stderr and exits with code `1`. Run it inside `tmux` or
+`screen` for a remote SSH session.
+
+```
++--------------------+----------------+----------------------------------+
+| Status             | Today          | Tweets/hr (last 24h)             |
+|  WAHA   CONNECTED  |  Scraped  12   |   ^                              |
+|  Accounts 4        |  Posted    9   |   |    .                         |
+|  Uptime  1h 23m    |  Pending   3   |   |   .  .   .                   |
++--------------------+----------------+----------------------------------+
+| Accounts (last seen)              | Recent tweets                       |
+|  @elonmusk         2m              |  OK @elonmusk 2m   GPU prices ...   |
+|  @whale_alert      11m             |  -- @whale_alert 11m  USDT mint ... |
+|  @cryptoanalyst    3h              |  OK @elonmusk 19m  Mars colony ...  |
++-----------------------------------+-------------------------------------+
+| Logs (live)                                                              |
+|  [12:03:01] [INFO]: cycle complete; 3 new tweets posted                  |
+|  [12:03:04] [WARN]: rate-limited by WAHA, sleeping 5s                    |
+|  [12:03:09] [INFO]: posted https://x.com/elonmusk/status/1742...         |
+|                                                                          |
++--------------------------------------------------------------------------+
+| ?:help  q:quit  r:refresh  s:scrape  a:accounts  c:clear                 |
++--------------------------------------------------------------------------+
+```
+
+### Keybindings
+
+| Key | Action |
+| --- | --- |
+| `q`, `Ctrl+C` | Quit and clean up (intervals stop, DB closes, log tail detaches). |
+| `r` | Refresh every panel immediately (does not wait for the next interval tick). |
+| `s` | Spawn `node cli.js scrape <first TARGET_ACCOUNT> --json --limit 5` as a child process; both stdout and stderr stream into the live logs panel with a `[scrape]` prefix. |
+| `a` | Open a prompt to add or remove a target account; reuses the same `accounts add` / `accounts remove` logic, including the X-handle alphabet validation. |
+| `c` | Clear the on-screen logs panel and the in-memory ring buffer. The on-disk log file (`./logs/bot.log`) is not modified. |
+| `?`, `h` | Show the help modal listing every keybinding. |
+| Arrow keys, `PgUp`, `PgDn` | Scroll the live logs panel (delegated to blessed-contrib's log widget). |
+
+### Notes and limitations
+
+- The dashboard cannot be piped to a file. Running `node cli.js dashboard >
+  out.txt` exits with code `1` and the TTY guard message above.
+- For SSH sessions, run inside `tmux` or `screen` so the layout survives
+  disconnects and the underlying TTY is preserved across reconnects.
+- Panel refresh defaults to 15 seconds; the `Uptime` field updates every
+  second via a separate lightweight interval. Lower the panel cadence with
+  `--refresh 5` if you want sub-15s feedback while debugging a scrape cycle.
+- The dashboard is a developer tool. The Docker image's `CMD` is still
+  `["node", "bot.js"]` and Railway runs the scheduler, not the TUI.
+
 ## Configuration
 
 Every variable below is read from `.env` (loaded by `dotenv`). The Docker
@@ -111,26 +253,6 @@ image and `docker-compose.yml` forward the same names.
 | `MAX_TWEETS_PER_CHECK` | `5` | Maximum number of new tweets posted per account per cycle. |
 | `HEADLESS` | `true` | Run Chromium headless. Set to `false` for local debugging only. |
 | `PUPPETEER_EXECUTABLE_PATH` | unset | Path to a system Chromium binary. The Docker image sets this to `/usr/bin/chromium`. |
-
-## Testing
-
-The repo ships a small smoke-test CLI in `test.js`:
-
-```bash
-npm test -- test:waha       # check WAHA session state and engine
-npm test -- test:scraper    # open a non-headless browser and dump tweets
-npm test -- test:send       # send a test message to WAHA_CHANNEL_ID
-npm test -- stats           # show counts and recent rows from ./data/bot.db
-npm test -- logs            # tail the last 50 JSON-line records from ./logs/bot.log
-```
-
-The bot itself can be sanity-checked without launching anything:
-
-```bash
-node --check bot.js
-TARGET_ACCOUNTS=elonmusk WAHA_CHANNEL_ID=123@newsletter \
-  node -e "console.log(Object.keys(require('./bot.js')).sort().join(','))"
-```
 
 ## Troubleshooting
 

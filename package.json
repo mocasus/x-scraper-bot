@@ -3,14 +3,24 @@
   "version": "1.0.0",
   "description": "Simple X/Twitter Scraper to WhatsApp Channel",
   "main": "bot.js",
+  "bin": {
+    "x-scraper": "./cli.js"
+  },
   "scripts": {
     "start": "node bot.js",
+    "start:cli": "node cli.js start",
+    "cli": "node cli.js",
+    "dashboard": "node cli.js dashboard",
     "dev": "nodemon bot.js",
-    "test": "node test.js"
+    "test": "node --test 'test/**/*.test.js'",
+    "test:coverage": "node --test --experimental-test-coverage 'test/**/*.test.js'"
   },
   "dependencies": {
     "axios": "^1.6.0",
     "better-sqlite3": "^9.4.0",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
+    "commander": "^12.1.0",
     "dotenv": "^16.3.1",
     "puppeteer": "^21.5.0"
   },
