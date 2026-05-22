@@ -17,6 +17,8 @@
   "dependencies": {
     "axios": "^1.6.0",
     "better-sqlite3": "^9.4.0",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
     "commander": "^12.1.0",
     "dotenv": "^16.3.1",
     "puppeteer": "^21.5.0"
