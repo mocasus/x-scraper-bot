@@ -849,3 +849,151 @@ test('dbReset --confirm prints a stop-the-bot warning for the real-path branch',
     fs.rmSync(tmpDir, { recursive: true, force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// FEAT-003: dashboard subcommand wiring
+// ---------------------------------------------------------------------------
+
+test('buildProgram help text includes dashboard and tui alias', () => {
+  const program = cli.buildProgram({ onExit: () => {} });
+  const help = program.helpInformation();
+  assert.match(help, /dashboard/);
+  assert.match(help, /tui/);
+});
+
+// We stub the './dashboard' module via require.cache so we never actually
+// open a screen during these tests. Each test installs the stub, runs the
+// program, then restores the previous cache entry in a try/finally so
+// subsequent tests see the real module again.
+function withStubbedDashboard(fn) {
+  const dashboardPath = require.resolve('../dashboard');
+  const previous = require.cache[dashboardPath];
+  const calls = [];
+  require.cache[dashboardPath] = {
+    id: dashboardPath,
+    filename: dashboardPath,
+    loaded: true,
+    exports: {
+      runDashboard: async (opts) => {
+        calls.push(opts);
+        return 0;
+      },
+    },
+  };
+  return Promise.resolve()
+    .then(() => fn(calls))
+    .finally(() => {
+      if (previous) {
+        require.cache[dashboardPath] = previous;
+      } else {
+        delete require.cache[dashboardPath];
+      }
+    });
+}
+
+test('dashboard subcommand --refresh option is parsed as an integer', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    await program.parseAsync(['dashboard', '--refresh', '5'], { from: 'user' });
+    assert.equal(calls.length, 1, 'runDashboard invoked exactly once');
+    assert.equal(calls[0].refreshSeconds, 5);
+  });
+});
+
+test('dashboard subcommand without --refresh defaults to 15 seconds', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    await program.parseAsync(['dashboard'], { from: 'user' });
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].refreshSeconds, 15);
+  });
+});
+
+test('tui alias resolves to the same dashboard subcommand', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    await program.parseAsync(['tui'], { from: 'user' });
+    assert.equal(calls.length, 1, 'tui alias triggers runDashboard');
+    assert.equal(calls[0].refreshSeconds, 15);
+  });
+});
+
+test('dashboard subcommand registration exposes --refresh on the subcommand object', () => {
+  const program = cli.buildProgram({ onExit: () => {} });
+  const sub = program.commands.find((c) => c.name() === 'dashboard');
+  assert.ok(sub, 'dashboard subcommand is registered on the program');
+  assert.deepEqual(sub.aliases(), ['tui'], 'tui is the alias');
+  const refreshOpt = sub.options.find((o) => o.long === '--refresh');
+  assert.ok(refreshOpt, '--refresh option is registered');
+  assert.equal(refreshOpt.defaultValue, 15, '--refresh defaults to 15');
+});
+
+// v1 review fix 7: --refresh runs through a commander custom parser, so
+// non-numeric values fail loud at parse time instead of silently falling
+// back to the runDashboard NaN-coercion default of 15.
+test('dashboard subcommand rejects --refresh abc with a commander error', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    // Commander's exitOverride does not propagate to subcommands; the
+    // dashboard option parser error fires on the subcommand itself, so we
+    // also override exit there to keep node:test from receiving a real
+    // process.exit(1).
+    for (const sub of program.commands) sub.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    let caught = null;
+    try {
+      await program.parseAsync(['dashboard', '--refresh', 'abc'], { from: 'user' });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, '--refresh abc should throw under exitOverride');
+    assert.equal(caught.code, 'commander.invalidArgument');
+    assert.match(caught.message, /positive integer/);
+    assert.equal(calls.length, 0, 'runDashboard must not run when --refresh is invalid');
+  });
+});
+
+test('dashboard subcommand rejects --refresh 0 (must be at least 1)', async () => {
+  await withStubbedDashboard(async (calls) => {
+    const program = cli.buildProgram({ onExit: () => {} });
+    program.exitOverride();
+    for (const sub of program.commands) sub.exitOverride();
+    program.configureOutput({
+      writeOut: () => {},
+      writeErr: () => {},
+      outputError: () => {},
+    });
+    let caught = null;
+    try {
+      await program.parseAsync(['dashboard', '--refresh', '0'], { from: 'user' });
+    } catch (e) {
+      caught = e;
+    }
+    assert.ok(caught, '--refresh 0 should throw under exitOverride');
+    assert.equal(caught.code, 'commander.invalidArgument');
+    assert.equal(calls.length, 0);
+  });
+});

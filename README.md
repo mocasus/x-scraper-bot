@@ -121,6 +121,7 @@ are unchanged; the CLI is additive.
 | `accounts remove <username>` | Drop a username from `TARGET_ACCOUNTS` in `.env` (case-insensitive). | (none) |
 | `db migrate` | Ensure the `tweets` table exists. Idempotent. | (none) |
 | `db reset` | Drop and recreate the `tweets` table. Refuses without `--confirm`. | `--confirm` |
+| `dashboard` | Open the TUI dashboard for live monitoring. Requires a TTY. Alias: `tui`. | `--refresh <seconds>` (default `15`) |
 
 ### CLI examples
 
@@ -166,6 +167,72 @@ node --check cli.js
 TARGET_ACCOUNTS=elonmusk WAHA_CHANNEL_ID=123@newsletter \
   node -e "console.log(Object.keys(require('./bot.js')).sort().join(','))"
 ```
+
+## Dashboard
+
+The `dashboard` subcommand opens a developer TUI on top of the same SQLite
+database and JSON-line log file the scheduler reads. It is observer-mode: it
+does not start the scraper, post to WAHA, or mutate the DB. You can run it
+concurrently with `node bot.js` because SQLite is opened in WAL mode and the
+log file is tailed read-only.
+
+```bash
+npm run dashboard                       # equivalent to: node cli.js dashboard
+node cli.js dashboard --refresh 5       # refresh panels every 5 seconds
+node cli.js tui                         # short alias
+```
+
+The dashboard requires a real TTY. If `stdout` is not a TTY (when piped to a
+file, run inside CI, or invoked over a non-interactive SSH session) the
+process prints `dashboard requires a TTY (run from an interactive terminal;
+not pipeable)` to stderr and exits with code `1`. Run it inside `tmux` or
+`screen` for a remote SSH session.
+
+```
++--------------------+----------------+----------------------------------+
+| Status             | Today          | Tweets/hr (last 24h)             |
+|  WAHA   CONNECTED  |  Scraped  12   |   ^                              |
+|  Accounts 4        |  Posted    9   |   |    .                         |
+|  Uptime  1h 23m    |  Pending   3   |   |   .  .   .                   |
++--------------------+----------------+----------------------------------+
+| Accounts (last seen)              | Recent tweets                       |
+|  @elonmusk         2m              |  OK @elonmusk 2m   GPU prices ...   |
+|  @whale_alert      11m             |  -- @whale_alert 11m  USDT mint ... |
+|  @cryptoanalyst    3h              |  OK @elonmusk 19m  Mars colony ...  |
++-----------------------------------+-------------------------------------+
+| Logs (live)                                                              |
+|  [12:03:01] [INFO]: cycle complete; 3 new tweets posted                  |
+|  [12:03:04] [WARN]: rate-limited by WAHA, sleeping 5s                    |
+|  [12:03:09] [INFO]: posted https://x.com/elonmusk/status/1742...         |
+|                                                                          |
++--------------------------------------------------------------------------+
+| ?:help  q:quit  r:refresh  s:scrape  a:accounts  c:clear                 |
++--------------------------------------------------------------------------+
+```
+
+### Keybindings
+
+| Key | Action |
+| --- | --- |
+| `q`, `Ctrl+C` | Quit and clean up (intervals stop, DB closes, log tail detaches). |
+| `r` | Refresh every panel immediately (does not wait for the next interval tick). |
+| `s` | Spawn `node cli.js scrape <first TARGET_ACCOUNT> --json --limit 5` as a child process; both stdout and stderr stream into the live logs panel with a `[scrape]` prefix. |
+| `a` | Open a prompt to add or remove a target account; reuses the same `accounts add` / `accounts remove` logic, including the X-handle alphabet validation. |
+| `c` | Clear the on-screen logs panel and the in-memory ring buffer. The on-disk log file (`./logs/bot.log`) is not modified. |
+| `?`, `h` | Show the help modal listing every keybinding. |
+| Arrow keys, `PgUp`, `PgDn` | Scroll the live logs panel (delegated to blessed-contrib's log widget). |
+
+### Notes and limitations
+
+- The dashboard cannot be piped to a file. Running `node cli.js dashboard >
+  out.txt` exits with code `1` and the TTY guard message above.
+- For SSH sessions, run inside `tmux` or `screen` so the layout survives
+  disconnects and the underlying TTY is preserved across reconnects.
+- Panel refresh defaults to 15 seconds; the `Uptime` field updates every
+  second via a separate lightweight interval. Lower the panel cadence with
+  `--refresh 5` if you want sub-15s feedback while debugging a scrape cycle.
+- The dashboard is a developer tool. The Docker image's `CMD` is still
+  `["node", "bot.js"]` and Railway runs the scheduler, not the TUI.
 
 ## Configuration
 

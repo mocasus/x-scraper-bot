@@ -20,7 +20,7 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
-const { Command } = require('commander');
+const { Command, InvalidArgumentError } = require('commander');
 
 const bot = require('./bot.js');
 const pkg = require('./package.json');
@@ -594,6 +594,17 @@ function dbReset(args) {
 // factory and then call `program.parseAsync([...], {from:'user'})`.
 // ---------------------------------------------------------------------------
 
+// Custom parser for --refresh. Without this, commander stores the raw string
+// and runDashboard's NaN coercion silently falls back to 15. This makes the
+// invalid input loud at parse time.
+function parseRefresh(value) {
+  const n = parseInt(value, 10);
+  if (!Number.isFinite(n) || n < 1) {
+    throw new InvalidArgumentError('--refresh must be a positive integer (seconds)');
+  }
+  return n;
+}
+
 function buildProgram(opts) {
   const o = opts || {};
   const onExit = typeof o.onExit === 'function' ? o.onExit : (code) => process.exit(code);
@@ -706,6 +717,21 @@ function buildProgram(opts) {
     .action((options) => {
       const r = dbReset({ confirm: Boolean(options.confirm) });
       if (r.code !== 0) onExit(r.code);
+    });
+
+  program
+    .command('dashboard')
+    .alias('tui')
+    .description('open the TUI dashboard for live monitoring (requires a TTY)')
+    .option('--refresh <seconds>', 'panel refresh interval in seconds', parseRefresh, 15)
+    .action(async (cmdOpts) => {
+      // Lazy-require so blessed/blessed-contrib stay off the import path of
+      // every other subcommand (and `cli.js --help`). Tests can stub the
+      // module via require.cache before calling parseAsync.
+      // eslint-disable-next-line global-require
+      const { runDashboard } = require('./dashboard');
+      const code = await runDashboard({ refreshSeconds: cmdOpts.refresh });
+      if (code && code !== 0) onExit(code);
     });
 
   return program;
