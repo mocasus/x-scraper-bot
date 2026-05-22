@@ -708,6 +708,22 @@ function buildProgram(opts) {
       if (r.code !== 0) onExit(r.code);
     });
 
+  program
+    .command('dashboard')
+    .alias('tui')
+    .description('open the TUI dashboard for live monitoring (requires a TTY)')
+    .option('--refresh <seconds>', 'panel refresh interval in seconds', '15')
+    .action(async (cmdOpts) => {
+      // Lazy-require so blessed/blessed-contrib stay off the import path of
+      // every other subcommand (and `cli.js --help`). Tests can stub the
+      // module via require.cache before calling parseAsync.
+      // eslint-disable-next-line global-require
+      const { runDashboard } = require('./dashboard');
+      const refreshSeconds = parseInt(cmdOpts.refresh, 10);
+      const code = await runDashboard({ refreshSeconds });
+      if (code && code !== 0) onExit(code);
+    });
+
   return program;
 }
 

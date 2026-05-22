@@ -10,6 +10,7 @@
     "start": "node bot.js",
     "start:cli": "node cli.js start",
     "cli": "node cli.js",
+    "dashboard": "node cli.js dashboard",
     "dev": "nodemon bot.js",
     "test": "node --test 'test/**/*.test.js'",
     "test:coverage": "node --test --experimental-test-coverage 'test/**/*.test.js'"
